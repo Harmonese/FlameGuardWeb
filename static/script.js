@@ -3,7 +3,8 @@ let pollTimer = null;
 let chartComp = null;
 let chartTemp = null;
 let lastDashboard = null;
-const POLL_INTERVAL_MS = 250;
+let POLL_INTERVAL_MS = 250;
+let DASHBOARD_LIMIT = 360;
 
 function showToast(msg) {
     const t = document.getElementById("error-toast");
@@ -138,7 +139,7 @@ async function resetMonitoring() {
 
 async function fetchDashboard() {
     try {
-        const response = await fetch("/api/dashboard?limit=360", { cache: "no-store" });
+        const response = await fetch(`/api/dashboard?limit=${DASHBOARD_LIMIT}`, { cache: "no-store" });
         const data = await response.json();
         if (!data.success) throw new Error(data.error || "无法读取 dashboard");
         updateDashboard(data);
@@ -284,7 +285,21 @@ window.addEventListener('resize', function() {
     if (chartTemp) chartTemp.resize();
 });
 
-window.addEventListener('DOMContentLoaded', function() {
+async function loadRuntimeConfig() {
+    try {
+        const response = await fetch("/api/config", { cache: "no-store" });
+        const data = await response.json();
+        if (data.success) {
+            POLL_INTERVAL_MS = Number(data.refresh_ms) || POLL_INTERVAL_MS;
+            DASHBOARD_LIMIT = Number(data.dashboard_default_limit) || DASHBOARD_LIMIT;
+        }
+    } catch (err) {
+        console.warn("使用默认前端轮询配置", err);
+    }
+}
+
+window.addEventListener('DOMContentLoaded', async function() {
+    await loadRuntimeConfig();
     fetchDashboard();
     startPolling();
 });

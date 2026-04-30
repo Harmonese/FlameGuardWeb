@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from flask import Flask, jsonify, render_template, request
 
 from services.flameguard_adapter import FlameGuardWebAdapter
@@ -7,7 +9,24 @@ from services.flameguard_adapter import FlameGuardWebAdapter
 app = Flask(__name__)
 app.config["TEMPLATES_AUTO_RELOAD"] = True
 
-adapter = FlameGuardWebAdapter(history_limit=1800)
+def _int_env(name: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        value = default
+    if min_value is not None:
+        value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
+HISTORY_LIMIT = _int_env("FLAMEGUARD_HISTORY_LIMIT", 1800, min_value=120, max_value=20000)
+DASHBOARD_DEFAULT_LIMIT = _int_env("FLAMEGUARD_DASHBOARD_DEFAULT_LIMIT", 360, min_value=10, max_value=5000)
+DASHBOARD_MAX_LIMIT = _int_env("FLAMEGUARD_DASHBOARD_MAX_LIMIT", 1200, min_value=60, max_value=20000)
+REFRESH_MS = _int_env("FLAMEGUARD_REFRESH_MS", 250, min_value=100, max_value=5000)
+
+adapter = FlameGuardWebAdapter(history_limit=HISTORY_LIMIT)
 
 
 @app.route("/")
@@ -18,11 +37,30 @@ def index():
 @app.route("/api/dashboard", methods=["GET"])
 def dashboard():
     try:
-        limit = int(request.args.get("limit", 360))
-        limit = max(10, min(1200, limit))
+        limit = int(request.args.get("limit", DASHBOARD_DEFAULT_LIMIT))
+        limit = max(10, min(DASHBOARD_MAX_LIMIT, limit))
         return jsonify(adapter.dashboard(history_limit=limit))
     except Exception as exc:
         return jsonify({"success": False, "error": str(exc)}), 500
+
+
+
+
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    return jsonify({"ok": True, "service": "FlameGuardWeb"})
+
+
+@app.route("/api/config", methods=["GET"])
+def runtime_config():
+    return jsonify({
+        "success": True,
+        "refresh_ms": REFRESH_MS,
+        "dashboard_default_limit": DASHBOARD_DEFAULT_LIMIT,
+        "dashboard_max_limit": DASHBOARD_MAX_LIMIT,
+        "history_limit": HISTORY_LIMIT,
+        "environment": os.environ.get("FLAMEGUARD_ENV", "development"),
+    })
 
 
 @app.route("/api/feedstock", methods=["POST"])
@@ -114,4 +152,7 @@ def legacy_result_from_dashboard(payload: dict) -> dict:
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, debug=False)
+    host = os.environ.get("FLAMEGUARD_HOST", "127.0.0.1")
+    port = _int_env("FLAMEGUARD_PORT", 5000, min_value=1, max_value=65535)
+    debug = os.environ.get("FLAMEGUARD_DEBUG", "0").lower() in {"1", "true", "yes", "on"}
+    app.run(host=host, port=port, debug=debug)

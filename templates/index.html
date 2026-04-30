@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>FlameGuardWeb 预热炉现场监视平台</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <button id="fullscreen-btn" class="btn-glow compact-fixed" onclick="toggleFullScreen()">全屏模式</button>
+
+    <div class="header">
+        <div class="header-title">
+            <h1>FlameGuardWeb 预热炉现场监视平台</h1>
+        </div>
+    </div>
+
+    <div class="dashboard">
+        <div class="panel left-panel">
+            <div class="panel-box">
+                <h2>物料监测 / 人工校正</h2>
+
+                <div class="input-group">
+                    <label>数据来源</label>
+                    <select id="source-select">
+                        <option value="manual">人工输入 / 现场校正</option>
+                        <option value="vision_ai">视觉识别</option>
+                        <option value="simulation" selected>仿真场景</option>
+                        <option value="history_replay">历史回放</option>
+                    </select>
+                </div>
+
+                <h3>垃圾组分 (和为 1)</h3>
+                <div class="composition-inputs">
+                    <div class="input-item"><label>菜叶</label><input type="number" step="0.01" id="x1" value="0.2"></div>
+                    <div class="input-item"><label>西瓜皮</label><input type="number" step="0.01" id="x2" value="0.2"></div>
+                    <div class="input-item"><label>橙子皮</label><input type="number" step="0.01" id="x3" value="0.1"></div>
+                    <div class="input-item"><label>肉</label><input type="number" step="0.01" id="x4" value="0.2"></div>
+                    <div class="input-item"><label>杂项混合</label><input type="number" step="0.01" id="x5" value="0.2"></div>
+                    <div class="input-item"><label>米饭</label><input type="number" step="0.01" id="x6" value="0.1"></div>
+                </div>
+
+                <h3>物料流与可信度</h3>
+                <div class="input-group">
+                    <label>入口湿垃圾流量 wet_mass_flow (kg/s)</label>
+                    <input type="number" step="0.001" id="wet_mass_flow" value="0.2315">
+                </div>
+                <div class="input-group">
+                    <label>组分可信度 confidence</label>
+                    <input type="number" step="0.05" min="0" max="1" id="confidence" value="1.0">
+                </div>
+
+                <div class="button-row">
+                    <button class="btn-glow" onclick="calculate()">提交组分 / 刷新监控</button>
+                    <button class="btn-glow secondary" onclick="startMonitoring()">启动</button>
+                    <button class="btn-glow secondary" onclick="stopMonitoring()">暂停</button>
+                    <button class="btn-glow secondary" onclick="resetMonitoring()">复位</button>
+                </div>
+
+                <div id="loading-container" style="display:none; margin-top: 15px;">
+                    <div id="loading-text" class="glow-text blinking" style="margin-bottom: 5px; font-size: 14px;">正在提交现场组分...</div>
+                    <div class="progress-bar-bg">
+                        <div class="progress-bar-fill" id="progress-bar"></div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="panel-box status-panel">
+                <h2>状态监控</h2>
+                <div class="status-grid four">
+                    <div class="status-item">
+                        <span class="label">系统状态</span>
+                        <span class="value" id="status-feas">连接中</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="label">炉温偏差</span>
+                        <span class="value" id="status-dev">-- °C</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="label">安全裕度</span>
+                        <span class="value" id="status-safety">-- °C</span>
+                    </div>
+                    <div class="status-item">
+                        <span class="label">数据状态</span>
+                        <span class="value" id="status-stale">--</span>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="panel center-panel">
+            <div id="vtu-container" class="chart-container model-container">
+                <h2 class="model-title">模型三维视图预览</h2>
+                <iframe src="{{ url_for('static', filename='model.html') }}" frameborder="0" style="width: 100%; height: 100%; border: none;"></iframe>
+            </div>
+            <div id="chart-temperature" class="chart-container"></div>
+        </div>
+
+        <div class="panel right-panel">
+            <div class="panel-box" style="display: flex; flex-direction: column;">
+                <h2>垃圾组分比例</h2>
+                <div id="chart-composition" style="flex: 1; width: 100%; min-height: 250px;"></div>
+            </div>
+
+            <div class="panel-box">
+                <h2>控制器建议与执行状态</h2>
+
+                <h3 style="margin-top:0;">预热炉控制状态</h3>
+                <ul class="result-list">
+                    <li><span class="label">Tg_ref / Tg_cmd</span> <span class="value" id="res-tg">-- °C</span></li>
+                    <li><span class="label">vg_ref / vg_cmd</span> <span class="value" id="res-vg">-- m/s</span></li>
+                    <li><span class="label">出口物料温度</span> <span class="value" id="res-tm">-- °C</span></li>
+                    <li><span class="label">出口含水率 omega_out</span> <span class="value" id="res-w">-- %</span></li>
+                    <li><span class="label">辅助补热 Q_aux</span> <span class="value" id="res-qreq">-- kW</span></li>
+                    <li><span class="label">循环风机功率</span> <span class="value" id="res-qsup">-- kW</span></li>
+                    <li><span class="label">NMPC求解状态</span> <span class="value" id="res-nmpc-note">--</span></li>
+                </ul>
+
+                <h3 style="margin-top:15px;">炉内与资源诊断</h3>
+                <ul class="result-list">
+                    <li><span class="label">炉温目标 T_set</span> <span class="value" id="res-ttar">-- °C</span></li>
+                    <li><span class="label">目标含水率 omega_target</span> <span class="value" id="res-wtar">-- %</span></li>
+                    <li><span class="label">烟囱温度 / 速度</span> <span class="value" id="res-tset">--</span></li>
+                    <li><span class="label">烟气质量预估</span> <span class="value" id="res-mdot">-- kg/s</span></li>
+                </ul>
+            </div>
+        </div>
+    </div>
+
+    <div id="error-toast" class="toast"></div>
+
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
+    <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>

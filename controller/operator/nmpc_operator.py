@@ -1,0 +1,791 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+import time
+from typing import Sequence
+
+import numpy as np
+
+import os
+
+
+def _get_scipy_minimize():
+    if os.environ.get("FLAMEGUARD_DISABLE_SCIPY", "").strip():
+        return None
+    try:  # scipy is optional; fallback is safe nominal hold.
+        from scipy.optimize import minimize
+        return minimize
+    except Exception:  # pragma: no cover
+        return None
+
+from domain.types import ActuatorCommand, FeedstockObservation, FurnaceObservation, MPCDecision, OperatorContext, StateEstimate
+from controller.predictor.preheater import PreheaterForwardModel
+from controller.predictor.furnace import FurnaceDyn, dry_basis_ratio_from_feedstock, furnace_feed_from_preheater_output, furnace_static_outputs_from_inputs
+from controller.predictor.actuator import ActuatorDynamic, ActuatorDynamicConfig
+from controller.predictor.resource import ResourceModel, ResourceState
+from controller.predictor.feed_preview import FeedPreviewProvider, ConstantFeedPreview
+from domain.types import ResourceBoundary
+from controller.predictor.physics import power_kW
+
+
+@dataclass
+class NMPCConfig:
+    """Control-blocking nonlinear MPC configuration."""
+
+    dt_pred_s: float = 20.0
+    # Internal integration step used inside each prediction interval.  The
+    # decision/update grid can remain coarse (dt_pred_s), but the distributed
+    # preheater model is sensitive to very large integration steps.  A smaller
+    # rollout step keeps NMPC predictions close to the plant without increasing
+    # the number of optimization variables.
+    rollout_dt_s: float = 5.0
+    horizon_s: float = 600.0
+    block_edges_s: tuple[float, ...] = (0.0, 120.0, 300.0, 480.0, 600.0)
+    reoptimize_s: float = 20.0
+
+    T_set_C: float = 872.99
+    omega_ref: float = 0.3218
+
+    T_ref_low_C: float = 850.0
+    T_ref_high_C: float = 895.99
+    T_safe_low_C: float = 850.0
+    T_safe_high_C: float = 1100.0
+
+    Tg_min_C: float = 100.0
+    Tg_max_C: float = 1100.0
+    vg_min_mps: float = 3.0
+    vg_max_mps: float = 12.0
+
+    nominal_Tg_C: float = 800.0
+    nominal_vg_mps: float = 12.0
+
+    q_Tavg: float = 1.0
+    q_ref_band: float = 24.0
+    q_safe_band: float = 650.0
+    q_terminal_Tavg: float = 18.0
+    q_omega: float = 30.0
+    r_energy: float = 1.0e-4
+    r_aux_heat: float = 5.0e-5
+    r_nominal_Tg: float = 2.0e-5
+    # Do not penalize around nominal_vg=12; that would encourage high flow.
+    r_nominal_vg: float = 0.0
+    r_delta_Tg: float = 8.0e-5
+    r_delta_vg: float = 0.08
+
+    # Economic operation: high v_g remains available for emergency recovery,
+    # but reference-band operation should prefer lower circulation/flow.
+    economic_vg_mps: float = 8.0
+    high_vg_threshold_mps: float = 8.5
+    r_economic_vg: float = 0.015
+    r_high_vg: float = 0.45
+    r_fan_power: float = 0.12
+    r_aux_flow: float = 2.2
+    ref_band_economy_multiplier: float = 2.5
+
+    max_Tg_slew_C_per_s: float = 20.0
+    max_vg_slew_mps_per_s: float = 0.4
+    actuator_tau_Tg_s: float = 3.0
+    actuator_tau_vg_s: float = 1.0
+
+    maxiter: int = 35
+    ftol: float = 1.0e-3
+    fallback_on_fail: bool = True
+
+    # When measured furnace temperature is already below the compliance floor,
+    # do not keep a stale cached plan for the whole nominal reoptimization
+    # interval.  This forces best-effort recovery updates at a shorter interval.
+    emergency_reoptimize_below_safe: bool = True
+    emergency_reoptimize_interval_s: float = 20.0
+    emergency_reoptimize_margin_C: float = 0.0
+
+    # Aggressive safety recovery tuning.  These do not change the normal
+    # economic objective in the reference band; they only take effect when the
+    # predicted furnace temperature approaches or drops below the compliance
+    # floor.  In that region, recovery speed dominates auxiliary heat/flow cost.
+    recovery_mode_enabled: bool = True
+    recovery_trigger_margin_C: float = 20.0
+    recovery_economy_multiplier: float = 0.02
+    recovery_safe_multiplier: float = 8.0
+    recovery_ref_low_multiplier: float = 3.0
+    recovery_terminal_safe_multiplier: float = 8.0
+
+
+
+
+@dataclass
+class NMPCSolveProfile:
+    """Wall-clock diagnostics for one synchronous NMPC optimization."""
+
+    time_s: float
+    source: str
+    seed_count: int = 0
+    seed_eval_ms: float = 0.0
+    minimize_ms: float = 0.0
+    final_eval_ms: float = 0.0
+    total_ms: float = 0.0
+    nfev: int = 0
+    nit: int = 0
+    success: bool = False
+    cost: float = float("nan")
+    message: str = ""
+
+
+
+@dataclass(frozen=True)
+class _RolloutContext:
+    """Precomputed data shared by all objective evaluations in one NMPC solve."""
+
+    feeds: list[FeedstockObservation]
+    rollout_dt_s: float
+    steps: int
+    elapsed_s: tuple[float, ...]
+    step_dt_s: tuple[float, ...]
+    block_indices: tuple[int, ...]
+
+class NonlinearMPCController:
+    """Control-blocking NMPC using the complete distributed preheater rollout.
+
+    Main decisions are generated by optimizing a future Tg/vg sequence and
+    evaluating it on the full 20-cell preheater + furnace model.  Feed preview,
+    dynamic stack resources, auxiliary heat accounting, and first-order actuator
+    dynamics are included in the prediction path.
+    """
+
+    def __init__(self, cfg: NMPCConfig | None = None, fallback_controller=None, resource_model: ResourceModel | None = None):
+        self.cfg = cfg or NMPCConfig()
+        self.fallback_controller = fallback_controller
+        self.resource_model = resource_model or ResourceModel()
+        self.prev_Tg_ref_C = float(self.cfg.nominal_Tg_C)
+        self.prev_vg_ref_mps = float(self.cfg.nominal_vg_mps)
+        self.prev_solution: np.ndarray | None = None
+        self.plan_start_s: float | None = None
+        self.next_reopt_s: float = -math.inf
+        self.last_decision: MPCDecision | None = None
+        self.last_solve_profile: NMPCSolveProfile | None = None
+        self.next_emergency_reopt_s: float = -math.inf
+        # Cache inverse COMSOL-surrogate moisture targets.  Full SLSQP evaluates
+        # hundreds of rollout objectives; each stage previously solved a 40-step
+        # bisection even when the dry-load coordinate was identical.
+        self._omega_target_cache: dict[tuple[float, float], float] = {}
+
+    @property
+    def n_blocks(self) -> int:
+        return max(1, len(self.cfg.block_edges_s) - 1)
+
+    def initialize(self, *, Tg_ref_C: float, vg_ref_mps: float, time_s: float = 0.0) -> None:
+        self.prev_Tg_ref_C = float(Tg_ref_C)
+        self.prev_vg_ref_mps = float(vg_ref_mps)
+        z = []
+        for _ in range(self.n_blocks):
+            z.extend([self.prev_Tg_ref_C, self.prev_vg_ref_mps])
+        self.prev_solution = np.asarray(z, dtype=float)
+        self.plan_start_s = float(time_s)
+        self.next_reopt_s = float(time_s)
+
+    def _bounds(self, resource: ResourceBoundary):
+        # Temperature bound is the effective cap. Natural stack temperature may be
+        # lower, in which case auxiliary heat is charged in rollout/execution.
+        Tg_hi = min(float(resource.T_stack_cap_C), self.cfg.Tg_max_C)
+        vg_hi = min(float(resource.v_stack_cap_mps), self.cfg.vg_max_mps)
+        b = []
+        for _ in range(self.n_blocks):
+            b.append((self.cfg.Tg_min_C, max(self.cfg.Tg_min_C, Tg_hi)))
+            b.append((self.cfg.vg_min_mps, max(self.cfg.vg_min_mps, vg_hi)))
+        return b
+
+    def _clip_z(self, z: Sequence[float], resource: ResourceBoundary) -> np.ndarray:
+        bounds = self._bounds(resource)
+        zz = np.asarray(z, dtype=float).copy()
+        for i, (lo, hi) in enumerate(bounds):
+            zz[i] = float(np.clip(zz[i], lo, hi))
+        return zz
+
+    def _block_index(self, elapsed_s: float) -> int:
+        edges = self.cfg.block_edges_s
+        for i in range(len(edges) - 1):
+            if edges[i] <= elapsed_s < edges[i + 1] - 1e-12:
+                return i
+        return self.n_blocks - 1
+
+    def _control_from_z(self, z: Sequence[float], elapsed_s: float) -> tuple[float, float]:
+        j = self._block_index(elapsed_s)
+        return float(z[2 * j]), float(z[2 * j + 1])
+
+    def _initial_guess_pool(self, obs: FurnaceObservation, resource: ResourceBoundary, prev_cmd: ActuatorCommand | None):
+        pool: list[np.ndarray] = []
+        if self.prev_solution is not None:
+            old = self._clip_z(self.prev_solution, resource)
+            shifted = old.copy()
+            if self.n_blocks > 1:
+                shifted[:-2] = old[2:]
+                shifted[-2:] = old[-2:]
+            pool.append(shifted)
+
+        def const_seq(Tg, vg):
+            z = []
+            for _ in range(self.n_blocks):
+                z.extend([Tg, vg])
+            return self._clip_z(z, resource)
+
+        recovery_now = self._recovery_mode_active(obs.T_avg_C)
+        if recovery_now:
+            # Give SLSQP an explicit full-recovery candidate.  This is especially
+            # important after large negative furnace disturbances: it prevents
+            # the optimizer from spending early iterations rediscovering the
+            # obvious max-heat/max-circulation recovery plan.
+            pool.append(const_seq(min(resource.T_stack_cap_C, self.cfg.Tg_max_C), self.cfg.vg_max_mps))
+
+        pool.append(const_seq(self.cfg.nominal_Tg_C, self.cfg.nominal_vg_mps))
+        if prev_cmd is not None:
+            pool.append(const_seq(prev_cmd.Tg_cmd_C, prev_cmd.vg_cmd_mps))
+
+        err = self.cfg.T_set_C - obs.T_avg_C
+        if err > 10.0:
+            pool.append(const_seq(min(resource.T_stack_cap_C, self.cfg.Tg_max_C), self.cfg.vg_max_mps))
+            pool.append(const_seq(min(1000.0, resource.T_stack_cap_C, self.cfg.Tg_max_C), self.cfg.vg_max_mps))
+        elif err < -20.0:
+            pool.append(const_seq(600.0, 6.0))
+            pool.append(const_seq(500.0, 3.0))
+
+        if err > 10.0 and self.n_blocks >= 2:
+            z = const_seq(self.cfg.nominal_Tg_C, self.cfg.nominal_vg_mps)
+            z[0] = min(resource.T_stack_cap_C, self.cfg.Tg_max_C)
+            z[1] = min(resource.v_stack_cap_mps, self.cfg.vg_max_mps)
+            pool.append(z)
+        if err < -10.0 and self.n_blocks >= 2:
+            z = const_seq(self.cfg.nominal_Tg_C, self.cfg.nominal_vg_mps)
+            z[0] = 500.0
+            z[1] = 3.0
+            pool.append(z)
+        return pool
+
+    def _make_actuator_prediction(self, prev_cmd: ActuatorCommand | None) -> ActuatorDynamic:
+        act = ActuatorDynamic(
+            ActuatorDynamicConfig(
+                tau_Tg_s=self.cfg.actuator_tau_Tg_s,
+                tau_vg_s=self.cfg.actuator_tau_vg_s,
+                max_dTg_C_per_s=self.cfg.max_Tg_slew_C_per_s,
+                max_dvg_mps_per_s=self.cfg.max_vg_slew_mps_per_s,
+                Tg_min_C=self.cfg.Tg_min_C,
+                Tg_max_C=self.cfg.Tg_max_C,
+                vg_min_mps=self.cfg.vg_min_mps,
+                vg_max_mps=self.cfg.vg_max_mps,
+            ),
+            opt_cfg=preheater_opt_cfg_placeholder(),
+        )
+        # Rebind opt_cfg below by direct assignment in rollout, where preheater exists.
+        if prev_cmd is not None:
+            act.initialize(prev_cmd.Tg_cmd_C, prev_cmd.vg_cmd_mps)
+        else:
+            act.initialize(self.prev_Tg_ref_C, self.prev_vg_ref_mps)
+        return act
+
+    def _feed_sequence(self, feed: FeedstockObservation, feed_preview: FeedPreviewProvider | None, *, dt_s: float) -> list[FeedstockObservation]:
+        provider = feed_preview or ConstantFeedPreview(feed)
+        return provider.get(feed.time_s, horizon_s=self.cfg.horizon_s, dt_s=dt_s)
+
+
+    def _furnace_feed_from_preheater(self, preheater: PreheaterForwardModel, state) -> object:
+        diag = getattr(preheater, "last_diagnostics", None)
+        mdot_d = getattr(diag, "dry_out_kgps", None) if diag is not None else None
+        mdot_w = getattr(diag, "water_out_kgps", None) if diag is not None else None
+        mdot_wet = getattr(diag, "wet_out_kgps", None) if diag is not None else None
+        if mdot_d is None and getattr(state, "cells", None):
+            mdot_d = state.cells[-1].dry_mass_kg / max(preheater.tau_cell_s, 1e-12)
+        if mdot_w is None and getattr(state, "cells", None):
+            mdot_w = state.cells[-1].water_mass_kg / max(preheater.tau_cell_s, 1e-12)
+        if mdot_wet is None and mdot_d is not None and mdot_w is not None:
+            mdot_wet = mdot_d + mdot_w
+        return furnace_feed_from_preheater_output(
+            time_s=state.time_s,
+            omega_b=state.omega_out,
+            mdot_d_kgps=mdot_d,
+            mdot_water_kgps=mdot_w,
+            mdot_wet_kgps=mdot_wet,
+        )
+
+    def _omega_target_for_temperature(self, T_target_C: float, mdot_d_kgps: float) -> float:
+        # COMSOL surrogate is monotone enough over [0, 0.5] for this control use:
+        # wetter feed lowers furnace temperature.  Cache by target and dry load
+        # because this inverse is called at every rollout stage in every SLSQP
+        # objective evaluation.
+        target = float(T_target_C)
+        mdot = float(mdot_d_kgps)
+        key = (round(target, 6), round(mdot, 9))
+        cached = self._omega_target_cache.get(key)
+        if cached is not None:
+            return cached
+
+        lo, hi = 0.0, 0.5
+        T_lo = furnace_static_outputs_from_inputs(
+            lo,
+            furnace_feed_from_preheater_output(time_s=0.0, omega_b=lo, mdot_d_kgps=mdot).rd,
+        ).T_avg_C
+        T_hi = furnace_static_outputs_from_inputs(
+            hi,
+            furnace_feed_from_preheater_output(time_s=0.0, omega_b=hi, mdot_d_kgps=mdot).rd,
+        ).T_avg_C
+        if target >= T_lo:
+            out = lo
+        elif target <= T_hi:
+            out = hi
+        else:
+            a, b = lo, hi
+            for _ in range(40):
+                mid = 0.5 * (a + b)
+                rd = furnace_feed_from_preheater_output(time_s=0.0, omega_b=mid, mdot_d_kgps=mdot).rd
+                T_mid = furnace_static_outputs_from_inputs(mid, rd).T_avg_C
+                if T_mid > target:
+                    a = mid
+                else:
+                    b = mid
+            out = float(0.5 * (a + b))
+        self._omega_target_cache[key] = float(out)
+        # Keep the cache bounded for long async runs with varying load.
+        if len(self._omega_target_cache) > 4096:
+            self._omega_target_cache.clear()
+            self._omega_target_cache[key] = float(out)
+        return float(out)
+
+    @staticmethod
+    def _disturbance_Tavg_C(disturbance) -> float:
+        if disturbance is None:
+            return 0.0
+        if isinstance(disturbance, (tuple, list)) and len(disturbance) >= 1:
+            return float(disturbance[0])
+        return float(disturbance)
+
+    def _omega_target_with_disturbance(self, T_observed_target_C: float, mdot_d_kgps: float, disturbance) -> float:
+        # Furnace predictions apply disturbance additively after the nominal
+        # COMSOL surrogate.  To hit an observed temperature target under a
+        # negative estimated Tavg disturbance, the nominal surrogate must reach
+        # a higher target: T_nominal = T_observed_target - d_hat.
+        nominal_target_C = float(T_observed_target_C) - self._disturbance_Tavg_C(disturbance)
+        return self._omega_target_for_temperature(nominal_target_C, mdot_d_kgps)
+
+    def _emergency_reoptimize_due(self, obs: FurnaceObservation) -> bool:
+        if not self.cfg.emergency_reoptimize_below_safe:
+            return False
+        threshold = self.cfg.T_safe_low_C - float(self.cfg.emergency_reoptimize_margin_C)
+        if obs.T_avg_C >= threshold:
+            return False
+        return obs.time_s + 1e-9 >= self.next_emergency_reopt_s
+
+    def _recovery_mode_active(self, Tavg_C: float) -> bool:
+        if not self.cfg.recovery_mode_enabled:
+            return False
+        threshold = self.cfg.T_safe_low_C + float(self.cfg.recovery_trigger_margin_C)
+        return float(Tavg_C) < threshold
+
+    def _make_rollout_context(self, feed: FeedstockObservation, feed_preview: FeedPreviewProvider | None) -> _RolloutContext:
+        rollout_dt = min(max(float(self.cfg.rollout_dt_s), 1e-6), max(float(self.cfg.dt_pred_s), 1e-6))
+        steps = max(1, int(math.ceil(self.cfg.horizon_s / rollout_dt)))
+        feeds = self._feed_sequence(feed, feed_preview, dt_s=rollout_dt)
+        elapsed: list[float] = []
+        step_dts: list[float] = []
+        block_indices: list[int] = []
+        for k in range(steps):
+            e = k * rollout_dt
+            elapsed.append(float(e))
+            step_dts.append(float(min(rollout_dt, max(self.cfg.horizon_s - e, 1e-9))))
+            block_indices.append(self._block_index(e))
+        return _RolloutContext(
+            feeds=feeds,
+            rollout_dt_s=float(rollout_dt),
+            steps=steps,
+            elapsed_s=tuple(elapsed),
+            step_dt_s=tuple(step_dts),
+            block_indices=tuple(block_indices),
+        )
+
+    def _furnace_feed_from_output(self, output) -> object:
+        return furnace_feed_from_preheater_output(
+            time_s=output.time_s,
+            omega_b=output.omega_out,
+            mdot_d_kgps=output.dry_out_kgps,
+            mdot_water_kgps=output.water_out_kgps,
+            mdot_wet_kgps=output.wet_out_kgps,
+        )
+
+    def _rollout_cost(self, z: Sequence[float], *, preheater: PreheaterForwardModel, furnace: FurnaceDyn,
+                      feed: FeedstockObservation, obs: FurnaceObservation, resource: ResourceBoundary,
+                      prev_cmd: ActuatorCommand | None, disturbance=None,
+                      feed_preview: FeedPreviewProvider | None = None,
+                      rollout_context: _RolloutContext | None = None) -> tuple[float, float, float, float, float, float, float]:
+        z = self._clip_z(z, resource)
+        p = preheater.clone()
+        f = furnace.clone()
+        ctx = rollout_context or self._make_rollout_context(feed, feed_preview)
+        cost = 0.0
+        pred_T = obs.T_avg_C
+        pred_stack = obs.T_stack_C
+        pred_vstack = obs.v_stack_mps
+        pred_w = float(p.omega[-1])
+        pred_mdot_d = float("nan")
+        max_T = -1e9
+        min_T = 1e9
+        aux_total = 0.0
+
+        act = ActuatorDynamic(
+            ActuatorDynamicConfig(
+                tau_Tg_s=self.cfg.actuator_tau_Tg_s,
+                tau_vg_s=self.cfg.actuator_tau_vg_s,
+                max_dTg_C_per_s=self.cfg.max_Tg_slew_C_per_s,
+                max_dvg_mps_per_s=self.cfg.max_vg_slew_mps_per_s,
+                Tg_min_C=self.cfg.Tg_min_C,
+                Tg_max_C=self.cfg.Tg_max_C,
+                vg_min_mps=self.cfg.vg_min_mps,
+                vg_max_mps=self.cfg.vg_max_mps,
+            ),
+            opt_cfg=p.opt_cfg,
+        )
+        if prev_cmd is not None:
+            act.initialize(prev_cmd.Tg_cmd_C, prev_cmd.vg_cmd_mps)
+        else:
+            act.initialize(self.prev_Tg_ref_C, self.prev_vg_ref_mps)
+
+        for k in range(ctx.steps):
+            elapsed = ctx.elapsed_s[k]
+            dt_step = ctx.step_dt_s[k]
+            j = ctx.block_indices[k]
+            Tg_ref = float(z[2 * j])
+            vg_ref = float(z[2 * j + 1])
+            res_state: ResourceState = self.resource_model.from_observation(
+                FurnaceObservation(time_s=obs.time_s + elapsed, T_avg_C=pred_T, T_stack_C=pred_stack, v_stack_mps=pred_vstack)
+            )
+            Tg_eff, vg_eff, applied = act.step(
+                Tg_ref,
+                vg_ref,
+                dt_step,
+                T_stack_available_C=res_state.T_stack_available_C,
+                v_stack_available_mps=res_state.v_stack_available_mps,
+                mdot_stack_cap_kgps=res_state.mdot_stack_available_kgps,
+            )
+            aux_total += applied.Q_aux_heat_kW * dt_step
+            ff = ctx.feeds[min(k, len(ctx.feeds) - 1)]
+            out = p.step_fast(ff, Tg_eff, vg_eff, dt_step)
+            pred_w = float(out.omega_out)
+            furnace_feed = self._furnace_feed_from_output(out)
+            pred_mdot_d = float(furnace_feed.mdot_d_kgps)
+            pred_T, pred_stack, pred_vstack = f.step(
+                furnace_feed.omega_b,
+                mdot_d_kgps=furnace_feed.mdot_d_kgps,
+                dt_s=dt_step,
+                disturbance=disturbance,
+            )
+            max_T = max(max_T, pred_T)
+            min_T = min(min_T, pred_T)
+
+            eT = pred_T - self.cfg.T_set_C
+            ref_hi = max(pred_T - self.cfg.T_ref_high_C, 0.0)
+            ref_lo = max(self.cfg.T_ref_low_C - pred_T, 0.0)
+            safe_hi = max(pred_T - self.cfg.T_safe_high_C, 0.0)
+            safe_lo = max(self.cfg.T_safe_low_C - pred_T, 0.0)
+            omega_target = self._omega_target_with_disturbance(self.cfg.T_set_C, furnace_feed.mdot_d_kgps, disturbance)
+            ew = pred_w - omega_target
+            try:
+                energy = power_kW(Tg_eff, vg_eff, p.opt_cfg)
+            except Exception:
+                energy = 0.0
+
+            in_ref_band = (ref_hi <= 1e-12 and ref_lo <= 1e-12)
+            recovery_stage = self._recovery_mode_active(pred_T)
+            economy_mult = self.cfg.ref_band_economy_multiplier if in_ref_band else 1.0
+            if recovery_stage:
+                economy_mult *= float(self.cfg.recovery_economy_multiplier)
+            high_v_excess = max(vg_eff - self.cfg.high_vg_threshold_mps, 0.0)
+            economic_v_error = max(vg_eff - self.cfg.economic_vg_mps, 0.0)
+            economic_cost = (
+                self.cfg.r_energy * energy
+                + self.cfg.r_fan_power * applied.fan_circulation_power_kW
+                + self.cfg.r_high_vg * high_v_excess * high_v_excess
+                + self.cfg.r_economic_vg * economic_v_error * economic_v_error
+                + self.cfg.r_aux_flow * applied.mdot_aux_flow_kgps * applied.mdot_aux_flow_kgps
+                + self.cfg.r_aux_heat * applied.Q_aux_heat_kW * applied.Q_aux_heat_kW
+            )
+            safe_weight = self.cfg.q_safe_band * (self.cfg.recovery_safe_multiplier if recovery_stage else 1.0)
+            ref_low_weight = self.cfg.q_ref_band * (self.cfg.recovery_ref_low_multiplier if recovery_stage else 1.0)
+            stage_cost = (
+                self.cfg.q_Tavg * eT * eT
+                + self.cfg.q_ref_band * ref_hi * ref_hi
+                + ref_low_weight * ref_lo * ref_lo
+                + safe_weight * (safe_hi * safe_hi + safe_lo * safe_lo)
+                + self.cfg.q_omega * ew * ew
+                + economy_mult * economic_cost
+            )
+            # Keep objective scale comparable when rollout_dt_s is smaller than
+            # dt_pred_s.  Otherwise simply refining the integration grid would
+            # multiply stage cost and change tuning semantics.
+            cost += stage_cost * (dt_step / max(self.cfg.dt_pred_s, 1e-9))
+
+        terminal = pred_T - self.cfg.T_set_C
+        cost += self.cfg.q_terminal_Tavg * terminal * terminal
+        terminal_safe_lo = max(self.cfg.T_safe_low_C - pred_T, 0.0)
+        if terminal_safe_lo > 0.0:
+            cost += self.cfg.q_terminal_Tavg * self.cfg.recovery_terminal_safe_multiplier * terminal_safe_lo * terminal_safe_lo
+
+        last_Tg = self.prev_Tg_ref_C
+        last_vg = self.prev_vg_ref_mps
+        recovery_now = self._recovery_mode_active(obs.T_avg_C)
+        move_mult = 0.25 if recovery_now else 1.0
+        economic_block_mult = float(self.cfg.recovery_economy_multiplier) if recovery_now else 1.0
+        for j in range(self.n_blocks):
+            Tg = float(z[2 * j]); vg = float(z[2 * j + 1])
+            cost += self.cfg.r_nominal_Tg * (Tg - self.cfg.nominal_Tg_C) ** 2 * economic_block_mult
+            cost += self.cfg.r_nominal_vg * (vg - self.cfg.nominal_vg_mps) ** 2 * economic_block_mult
+            cost += self.cfg.r_economic_vg * max(vg - self.cfg.economic_vg_mps, 0.0) ** 2 * economic_block_mult
+            cost += self.cfg.r_high_vg * max(vg - self.cfg.high_vg_threshold_mps, 0.0) ** 2 * economic_block_mult
+            cost += self.cfg.r_delta_Tg * (Tg - last_Tg) ** 2 * move_mult
+            cost += self.cfg.r_delta_vg * (vg - last_vg) ** 2 * move_mult
+            last_Tg, last_vg = Tg, vg
+
+        return float(cost), float(pred_T), float(pred_w), float(min_T), float(max_T), float(aux_total), float(pred_mdot_d)
+
+    def _fallback(self, *, estimate: StateEstimate) -> MPCDecision:
+        omega = float(estimate.preheater_state_est.omega_out)
+        mdot_d = (estimate.preheater_state_est.cells[-1].dry_mass_kg / max(getattr(self, "_last_tau_cell_s", 1.0), 1e-12)) if estimate.preheater_state_est.cells else 0.052
+        disturbance = (estimate.disturbance_est_Tavg_C, estimate.disturbance_est_Tstack_C, estimate.disturbance_est_vstack_mps)
+        omega_target = self._omega_target_with_disturbance(self.cfg.T_set_C, mdot_d, disturbance)
+        omega_max_for_safety = self._omega_target_with_disturbance(self.cfg.T_safe_low_C, mdot_d, disturbance)
+        safety_margin_C = float(estimate.furnace_obs.T_avg_C - self.cfg.T_safe_low_C)
+        return MPCDecision(
+            time_s=estimate.time_s,
+            Tg_ref_C=self.cfg.nominal_Tg_C,
+            vg_ref_mps=self.cfg.nominal_vg_mps,
+            omega_target=omega_target,
+            omega_reachable=omega,
+            predicted_Tavg_C=estimate.furnace_obs.T_avg_C,
+            predicted_omega_out=omega,
+            cost=float('inf'),
+            feasible=False,
+            source='nmpc_fallback_nominal',
+            safety_reachable=safety_margin_C >= 0.0,
+            predicted_min_Tavg_C=estimate.furnace_obs.T_avg_C,
+            predicted_max_Tavg_C=estimate.furnace_obs.T_avg_C,
+            omega_max_for_safety=omega_max_for_safety,
+            safety_margin_C=safety_margin_C,
+            note='NMPC unavailable; nominal fallback',
+        )
+
+    def _planned_decision(self, estimate: StateEstimate) -> MPCDecision | None:
+        obs = estimate.furnace_obs
+        if self.prev_solution is None or self.plan_start_s is None:
+            return None
+        elapsed = max(0.0, obs.time_s - self.plan_start_s)
+        if elapsed > self.cfg.horizon_s:
+            return None
+        Tg, vg = self._control_from_z(self.prev_solution, elapsed)
+        last = self.last_decision
+        omega = float(estimate.preheater_state_est.omega_out)
+        mdot_d = (estimate.preheater_state_est.cells[-1].dry_mass_kg / max(getattr(self, "_last_tau_cell_s", 1.0), 1e-12)) if estimate.preheater_state_est.cells else 0.052
+        disturbance = (estimate.disturbance_est_Tavg_C, estimate.disturbance_est_Tstack_C, estimate.disturbance_est_vstack_mps)
+        omega_target = self._omega_target_with_disturbance(self.cfg.T_set_C, mdot_d, disturbance)
+        last_margin = getattr(last, "safety_margin_C", float("nan")) if last is not None else float("nan")
+        return MPCDecision(
+            time_s=obs.time_s,
+            Tg_ref_C=Tg,
+            vg_ref_mps=vg,
+            omega_target=omega_target,
+            omega_reachable=omega,
+            predicted_Tavg_C=(last.predicted_Tavg_C if last is not None else obs.T_avg_C),
+            predicted_omega_out=(last.predicted_omega_out if last is not None else omega),
+            cost=(last.cost if last is not None else 0.0),
+            feasible=True,
+            source='nmpc_plan_hold',
+            safety_reachable=(getattr(last, 'safety_reachable', True) if last is not None else True),
+            predicted_min_Tavg_C=(getattr(last, 'predicted_min_Tavg_C', float('nan')) if last is not None else float('nan')),
+            predicted_max_Tavg_C=(getattr(last, 'predicted_max_Tavg_C', float('nan')) if last is not None else float('nan')),
+            omega_max_for_safety=(getattr(last, 'omega_max_for_safety', float('nan')) if last is not None else float('nan')),
+            safety_margin_C=last_margin,
+            note='Using cached NMPC plan between re-optimizations',
+        )
+
+
+    def step_context(self, context: OperatorContext) -> MPCDecision:
+        predictors = context.predictors
+        return self.step(
+            estimate=context.estimate,
+            preheater_predictor=predictors.preheater,
+            furnace_predictor=predictors.furnace,
+            feed=context.feedstock,
+            resource=context.resource,
+            prev_cmd=context.previous_command,
+            disturbance=None,
+            feed_preview=context.feed_preview,
+        )
+
+    def step(self, *, estimate: StateEstimate, preheater_predictor: PreheaterForwardModel, furnace_predictor: FurnaceDyn,
+             feed: FeedstockObservation, resource: ResourceBoundary, prev_cmd: ActuatorCommand | None = None,
+             disturbance=None, feed_preview: FeedPreviewProvider | None = None) -> MPCDecision:
+        obs = estimate.furnace_obs
+        # Operator owns no plant state.  It initializes a predictor copy strictly
+        # from StateEstimate, then all SLSQP evaluations use controller/predictor.
+        preheater = preheater_predictor.clone().load_state(estimate.preheater_state_est, feedstock=feed)
+        furnace = furnace_predictor
+        self._last_tau_cell_s = preheater.tau_cell_s
+        if disturbance is None:
+            disturbance = (
+                estimate.disturbance_est_Tavg_C,
+                estimate.disturbance_est_Tstack_C,
+                estimate.disturbance_est_vstack_mps,
+            )
+
+        emergency_due = self._emergency_reoptimize_due(obs)
+        if obs.time_s + 1e-9 < self.next_reopt_s and not emergency_due:
+            planned = self._planned_decision(estimate)
+            if planned is not None:
+                return planned
+
+        minimize = _get_scipy_minimize()
+        if minimize is None:
+            dec = self._fallback(estimate=estimate)
+            self.last_decision = dec
+            return dec
+
+        total_t0 = time.perf_counter()
+        pool = self._initial_guess_pool(obs, resource, prev_cmd)
+        rollout_context = self._make_rollout_context(feed, feed_preview)
+        seed_scores = []
+        seed_t0 = time.perf_counter()
+        for z0 in pool:
+            seed_scores.append((self._rollout_cost(z0, preheater=preheater, furnace=furnace, feed=feed,
+                                                   obs=obs, resource=resource, prev_cmd=prev_cmd,
+                                                   disturbance=disturbance, feed_preview=feed_preview,
+                                                   rollout_context=rollout_context)[0], z0))
+        seed_eval_ms = (time.perf_counter() - seed_t0) * 1000.0
+        z0 = min(seed_scores, key=lambda x: x[0])[1]
+
+        def obj(z):
+            val = self._rollout_cost(z, preheater=preheater, furnace=furnace, feed=feed,
+                                     obs=obs, resource=resource, prev_cmd=prev_cmd,
+                                     disturbance=disturbance, feed_preview=feed_preview,
+                                     rollout_context=rollout_context)[0]
+            if not np.isfinite(val):
+                return 1e30
+            return val
+
+        minimize_t0 = time.perf_counter()
+        try:
+            res = minimize(
+                obj,
+                z0,
+                method='SLSQP',
+                bounds=self._bounds(resource),
+                options={'maxiter': self.cfg.maxiter, 'ftol': self.cfg.ftol, 'disp': False},
+            )
+        except Exception as exc:
+            minimize_ms = (time.perf_counter() - minimize_t0) * 1000.0
+            dec = self._fallback(estimate=estimate)
+            self.last_decision = dec
+            out = MPCDecision(**{**dec.__dict__, 'source': dec.source + '_exception', 'note': str(exc)})
+            self.last_solve_profile = NMPCSolveProfile(
+                time_s=obs.time_s,
+                source=out.source,
+                seed_count=len(pool),
+                seed_eval_ms=seed_eval_ms,
+                minimize_ms=minimize_ms,
+                final_eval_ms=0.0,
+                total_ms=(time.perf_counter() - total_t0) * 1000.0,
+                success=False,
+                cost=float('inf'),
+                message=str(exc),
+            )
+            return out
+        minimize_ms = (time.perf_counter() - minimize_t0) * 1000.0
+
+        z_best = self._clip_z(res.x if getattr(res, 'x', None) is not None else z0, resource)
+        final_t0 = time.perf_counter()
+        cost, pred_T, pred_w, min_T, max_T, aux_total, pred_mdot_d = self._rollout_cost(
+            z_best,
+            preheater=preheater,
+            furnace=furnace,
+            feed=feed,
+            obs=obs,
+            resource=resource,
+            prev_cmd=prev_cmd,
+            disturbance=disturbance,
+            feed_preview=feed_preview,
+            rollout_context=rollout_context,
+        )
+        final_eval_ms = (time.perf_counter() - final_t0) * 1000.0
+        if not np.isfinite(cost):
+            dec = self._fallback(estimate=estimate)
+            self.last_decision = dec
+            self.last_solve_profile = NMPCSolveProfile(
+                time_s=obs.time_s,
+                source=dec.source,
+                seed_count=len(pool),
+                seed_eval_ms=seed_eval_ms,
+                minimize_ms=minimize_ms,
+                final_eval_ms=final_eval_ms,
+                total_ms=(time.perf_counter() - total_t0) * 1000.0,
+                nfev=int(getattr(res, 'nfev', 0) or 0),
+                nit=int(getattr(res, 'nit', 0) or 0),
+                success=False,
+                cost=float(cost),
+                message='non-finite final cost',
+            )
+            return dec
+
+        self.prev_solution = z_best
+        self.plan_start_s = float(obs.time_s)
+        self.next_reopt_s = float(obs.time_s + self.cfg.reoptimize_s)
+        if obs.T_avg_C < self.cfg.T_safe_low_C:
+            self.next_emergency_reopt_s = float(obs.time_s + self.cfg.emergency_reoptimize_interval_s)
+        else:
+            self.next_emergency_reopt_s = -math.inf
+        Tg_ref, vg_ref = self._control_from_z(z_best, 0.0)
+        self.prev_Tg_ref_C = float(Tg_ref)
+        self.prev_vg_ref_mps = float(vg_ref)
+        feasible = bool(getattr(res, 'success', True))
+        current_furnace_feed = self._furnace_feed_from_output(preheater.output(time_s=obs.time_s))
+        current_omega_target = self._omega_target_with_disturbance(self.cfg.T_set_C, current_furnace_feed.mdot_d_kgps, disturbance)
+        terminal_mdot_d = pred_mdot_d if np.isfinite(pred_mdot_d) else current_furnace_feed.mdot_d_kgps
+        omega_max_for_safety = self._omega_target_with_disturbance(self.cfg.T_safe_low_C, terminal_mdot_d, disturbance)
+        safety_margin_C = float(pred_T - self.cfg.T_safe_low_C)
+        safety_reachable = bool(safety_margin_C >= -1e-6)
+        dec = MPCDecision(
+            time_s=obs.time_s,
+            Tg_ref_C=float(Tg_ref),
+            vg_ref_mps=float(vg_ref),
+            omega_target=float(current_omega_target),
+            omega_reachable=float(pred_w),
+            predicted_Tavg_C=float(pred_T),
+            predicted_omega_out=float(pred_w),
+            cost=float(cost),
+            feasible=feasible,
+            source='nmpc_block_slsqp',
+            safety_reachable=safety_reachable,
+            predicted_min_Tavg_C=float(min_T),
+            predicted_max_Tavg_C=float(max_T),
+            omega_max_for_safety=float(omega_max_for_safety),
+            safety_margin_C=float(safety_margin_C),
+            note=(f'blocks={self.n_blocks}; rollout_dt={self.cfg.rollout_dt_s:g}s; success={getattr(res, "success", True)}; '
+                  f'minT={min_T:.2f}; maxT={max_T:.2f}; terminal_margin={safety_margin_C:.2f}; aux_kJ={aux_total:.1f}; '
+                  f'msg={getattr(res, "message", "")}'[:200]),
+        )
+        self.last_solve_profile = NMPCSolveProfile(
+            time_s=obs.time_s,
+            source=dec.source,
+            seed_count=len(pool),
+            seed_eval_ms=seed_eval_ms,
+            minimize_ms=minimize_ms,
+            final_eval_ms=final_eval_ms,
+            total_ms=(time.perf_counter() - total_t0) * 1000.0,
+            nfev=int(getattr(res, 'nfev', 0) or 0),
+            nit=int(getattr(res, 'nit', 0) or 0),
+            success=feasible,
+            cost=float(cost),
+            message=str(getattr(res, 'message', '')),
+        )
+        self.last_decision = dec
+        return dec
+
+
+def preheater_opt_cfg_placeholder():
+    # Keeps type checkers happy; actual rollout actuator objects are rebound to
+    # the cloned preheater's Config.  This function avoids importing Config at
+    # module top just for a default object.
+    from controller.predictor.config import Config
+    return Config()

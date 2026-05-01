@@ -21,10 +21,18 @@ def _int_env(name: str, default: int, min_value: int | None = None, max_value: i
     return value
 
 
+def _bool_env(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 HISTORY_LIMIT = _int_env("FLAMEGUARD_HISTORY_LIMIT", 1800, min_value=120, max_value=20000)
 DASHBOARD_DEFAULT_LIMIT = _int_env("FLAMEGUARD_DASHBOARD_DEFAULT_LIMIT", 360, min_value=10, max_value=5000)
 DASHBOARD_MAX_LIMIT = _int_env("FLAMEGUARD_DASHBOARD_MAX_LIMIT", 1200, min_value=60, max_value=20000)
 REFRESH_MS = _int_env("FLAMEGUARD_REFRESH_MS", 250, min_value=100, max_value=5000)
+HEALTH_REQUIRE_NMPC = _bool_env("FLAMEGUARD_HEALTH_REQUIRE_NMPC", True)
 
 adapter = FlameGuardWebAdapter(history_limit=HISTORY_LIMIT)
 
@@ -48,7 +56,12 @@ def dashboard():
 
 @app.route("/healthz", methods=["GET"])
 def healthz():
-    return jsonify({"ok": True, "service": "FlameGuardWeb"})
+    payload, status_code = adapter.health(require_realtime_nmpc=HEALTH_REQUIRE_NMPC)
+    payload.update({
+        "service": "FlameGuardWeb",
+        "environment": os.environ.get("FLAMEGUARD_ENV", "development"),
+    })
+    return jsonify(payload), status_code
 
 
 @app.route("/api/config", methods=["GET"])

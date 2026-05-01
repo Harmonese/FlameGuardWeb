@@ -10,6 +10,7 @@ runs on machines without scipy/numpy.
 """
 
 from threading import RLock
+from typing import Any
 
 from .composition_adapter import validate_composition
 from .telemetry_store import TelemetryStore
@@ -25,6 +26,8 @@ from .simulation_generator import Phase1SimulationGenerator
 
 
 class FlameGuardWebAdapter:
+    EXPECTED_GENERATOR_MODE = "realtime_fast_nmpc"
+
     def __init__(self, history_limit: int = 1200) -> None:
         self._lock = RLock()
         self.store = TelemetryStore(maxlen=history_limit)
@@ -42,6 +45,64 @@ class FlameGuardWebAdapter:
             self.generator_mode = "phase1_fallback"
             self.generator = Phase1SimulationGenerator()
             self._startup_error = str(_GENERATOR_IMPORT_ERROR)
+
+
+    def health(self, *, require_realtime_nmpc: bool = True) -> tuple[dict[str, Any], int]:
+        """Return a strict container/readiness health payload.
+
+        The old Flask endpoint only proved that the route was reachable. This
+        probe also verifies that the realtime NMPC generator imported,
+        initialized, and can produce a minimally valid dashboard snapshot.
+        """
+        with self._lock:
+            snapshot: dict[str, Any] | None = None
+            snapshot_error = ""
+            try:
+                snapshot = self.generator.snapshot()
+            except Exception as exc:  # pragma: no cover - defensive runtime probe
+                snapshot_error = str(exc)
+
+            required_dashboard_keys = {"success", "time_s", "running", "feedstock", "furnace", "preheater", "control", "health"}
+            snapshot_ok = bool(snapshot) and required_dashboard_keys.issubset(snapshot.keys()) and bool(snapshot.get("success"))
+            mode_ok = self.generator_mode == self.EXPECTED_GENERATOR_MODE
+            startup_ok = self._startup_error == ""
+            runtime_import_ok = RealtimeNMPCGenerator is not None
+
+            checks = {
+                "runtime_import_ok": runtime_import_ok,
+                "runtime_initialized": getattr(self, "generator", None) is not None,
+                "startup_ok": startup_ok,
+                "mode_ok": mode_ok,
+                "dashboard_snapshot_ok": snapshot_ok,
+                "realtime_nmpc_required": bool(require_realtime_nmpc),
+            }
+
+            ok = bool(
+                checks["runtime_initialized"]
+                and checks["dashboard_snapshot_ok"]
+                and ((checks["startup_ok"] and checks["mode_ok"]) if require_realtime_nmpc else True)
+            )
+
+            status: dict[str, Any] = {
+                "ok": ok,
+                "status": "ready" if ok else "not_ready",
+                "mode": self.generator_mode,
+                "expected_mode": self.EXPECTED_GENERATOR_MODE,
+                "startup_error": self._startup_error,
+                "snapshot_error": snapshot_error,
+                "checks": checks,
+            }
+            if snapshot is not None:
+                runtime_health = snapshot.get("health") or {}
+                status["runtime"] = {
+                    "schema": snapshot.get("schema"),
+                    "running": snapshot.get("running"),
+                    "time_s": snapshot.get("time_s"),
+                    "process_health_ok": bool(runtime_health.get("ok", True)),
+                    "process_health_message": runtime_health.get("message", ""),
+                }
+
+            return status, 200 if ok else 503
 
     def dashboard(self, *, history_limit: int = 240) -> dict:
         with self._lock:
